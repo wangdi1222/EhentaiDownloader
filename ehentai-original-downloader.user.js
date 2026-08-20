@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         E-Hentai Original Image Downloader
 // @namespace    local.ehentai.original-downloader
-// @version      1.0.4
+// @version      2.1.0
 // @description  Downloads the original image on each already-opened gallery page, then advances to the next page.
 // @match        *://e-hentai.org/s/*
 // @match        *://exhentai.org/s/*
@@ -24,10 +24,16 @@
     delayMs: 2500,
     count: 0,
     lastPage: '',
+    galleryId: null,
+    completedPages: {},
+    retriesByPage: {},
+    retryPending: false,
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   let executionInProgress = false;
+
+  class PageNotReadyError extends Error {}
 
   function readState() {
     try {
@@ -151,9 +157,14 @@
 
   function start() {
     const state = readState();
+    const currentPage = parseImagePage(location.href);
     state.running = true;
     state.count = 0;
     state.lastPage = '';
+    state.galleryId = currentPage?.galleryId ?? null;
+    state.completedPages = {};
+    state.retriesByPage = {};
+    state.retryPending = false;
     writeState(state);
     location.reload();
   }
@@ -164,14 +175,37 @@
     writeState(state);
   }
 
-  async function waitForOriginalLink(timeoutMs = 30000) {
+  async function waitForPageReady(expectedPage, timeoutMs = 60000) {
     const started = Date.now();
+    let previousSnapshot = '';
+    let stableSince = 0;
     while (Date.now() - started < timeoutMs) {
       const link = getOriginalLink();
-      if (link?.href) return link;
+      const image = document.querySelector('#img');
+      const counter = getPageCounter();
+      const isReady = link?.href
+        && image?.complete
+        && image.naturalWidth > 0
+        && counter?.current === expectedPage;
+
+      if (isReady) {
+        // The counter, displayed image and original link must remain unchanged
+        // briefly. This prevents taking the previous page's original link
+        // during E-Hentai's next-page transition.
+        const snapshot = `${counter.current}/${counter.total}|${image.currentSrc}|${link.href}`;
+        if (snapshot !== previousSnapshot) {
+          previousSnapshot = snapshot;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= 1200) {
+          return { link, counter };
+        }
+      } else {
+        previousSnapshot = '';
+        stableSince = 0;
+      }
       await sleep(250);
     }
-    throw new Error('没有找到“Download original”链接。该图片可能没有原图，或页面尚未加载完成。');
+    throw new PageNotReadyError(`第 ${expectedPage} 页没有在 60 秒内完成加载（原图链接、页码和显示图片未能同时稳定）。`);
   }
 
   function addPanel() {
@@ -191,7 +225,7 @@
     const delayInput = panel.querySelector('#eh-original-downloader-delay');
     const update = () => {
       const state = readState();
-      status.textContent = state.running ? `运行中：已下载 ${state.count} 张` : `未运行：已下载 ${state.count} 张`;
+      status.textContent = state.running ? `运行中：已确认 ${state.count} 张` : `未运行：已确认 ${state.count} 张`;
       delayInput.value = state.delayMs;
     };
 
@@ -214,35 +248,57 @@
   async function run() {
     if (executionInProgress) return;
     const state = readState();
-    if (!state.running) return;
+    if (!state.running || state.retryPending) return;
     executionInProgress = true;
 
-    if (state.lastPage === location.href) {
+    const page = parseImagePage(location.href);
+    if (!page) {
       state.running = false;
       writeState(state);
-      console.warn('[EH original downloader] Same page encountered twice; stopped to avoid a duplicate download.');
+      console.warn('[EH original downloader] Not on an image page; stopped.');
       executionInProgress = false;
       return;
     }
 
     try {
-      const originalLink = await waitForOriginalLink();
+      if (state.galleryId !== null && state.galleryId !== page.galleryId) {
+        throw new Error('当前页不属于本次下载的画廊，已停止以避免混入其他画廊。');
+      }
+
+      const { link: originalLink, counter } = await waitForPageReady(page.page);
       const current = readState();
       if (!current.running) return;
+      if (current.galleryId !== null && current.galleryId !== page.galleryId) {
+        throw new Error('画廊状态发生变化，已停止以避免重复或漏页。');
+      }
 
-      const nextCount = current.count + 1;
-      await download(originalLink.href, filenameFor(originalLink.href, nextCount));
+      const pageKey = `${page.galleryId}-${page.page}`;
+      if (current.retriesByPage?.[pageKey]) {
+        const recovered = { ...current, retriesByPage: { ...current.retriesByPage } };
+        delete recovered.retriesByPage[pageKey];
+        writeState(recovered);
+      }
+      const alreadyCompleted = Boolean(current.completedPages?.[pageKey]);
+
+      if (!alreadyCompleted) {
+        // The download callback is the commit point: a page is only recorded
+        // after Tampermonkey reports a successful save.
+        await download(originalLink.href, filenameFor(originalLink.href, page.page));
+
+        const committed = readState();
+        if (!committed.running) return;
+        committed.galleryId = page.galleryId;
+        committed.completedPages = { ...(committed.completedPages || {}), [pageKey]: true };
+        committed.count = Object.keys(committed.completedPages).length;
+        committed.lastPage = location.href;
+        writeState(committed);
+      }
 
       const afterDownload = readState();
       if (!afterDownload.running) return;
-      afterDownload.count = nextCount;
-      afterDownload.lastPage = location.href;
-      writeState(afterDownload);
-
-      await sleep(afterDownload.delayMs);
+      await sleep(Math.max(4000, afterDownload.delayMs));
       const next = getNextLink();
       if (!next?.href || next.href === location.href) {
-        const counter = getPageCounter();
         if (counter && counter.current < counter.total) {
           throw new Error(`已下载第 ${counter.current} 张，但没有定位到第 ${counter.current + 1} 张的右向三角链接。`);
         }
@@ -256,7 +312,28 @@
       next.click();
     } catch (error) {
       const failed = readState();
+      const failedPage = parseImagePage(location.href);
+      if (error instanceof PageNotReadyError && failedPage && failed.running) {
+        const pageKey = `${failedPage.galleryId}-${failedPage.page}`;
+        const retryCount = (failed.retriesByPage?.[pageKey] || 0) + 1;
+        failed.retriesByPage = { ...(failed.retriesByPage || {}), [pageKey]: retryCount };
+
+        if (retryCount <= 10) {
+          failed.retryPending = true;
+          writeState(failed);
+          console.warn(`[EH original downloader] Page ${failedPage.page} was not ready; refreshing for retry ${retryCount}/10.`);
+          setTimeout(() => location.reload(), 3000);
+          return;
+        }
+
+        failed.running = false;
+        failed.retryPending = false;
+        writeState(failed);
+        alert(`原图自动下载已停止：第 ${failedPage.page} 页连续 10 次刷新后仍未完成加载。`);
+        return;
+      }
       failed.running = false;
+      failed.retryPending = false;
       writeState(failed);
       console.error('[EH original downloader] Stopped:', error);
       alert(`原图自动下载已停止：${error.message}`);
@@ -279,6 +356,11 @@
   GM_registerMenuCommand('停止原图自动下载', stop);
 
   const initialize = () => {
+    const state = readState();
+    if (state.retryPending) {
+      state.retryPending = false;
+      writeState(state);
+    }
     addPanel();
     void run();
     // Some browser/extension combinations inject the user script before the
@@ -294,9 +376,10 @@
 
   window.addEventListener('pageshow', () => setTimeout(() => void run(), 300));
   // A navigation may complete without firing a fresh userscript lifecycle in
-  // some browser-extension combinations. This keeps the same tab advancing.
+  // some browser-extension combinations. The committed-page ledger prevents
+  // this retry from ever downloading the same page twice.
   setInterval(() => {
     const state = readState();
-    if (state.running && state.lastPage !== location.href) void run();
+    if (state.running) void run();
   }, 1000);
 })();
