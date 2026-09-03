@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         E-Hentai Original Image Downloader
 // @namespace    local.ehentai.original-downloader
-// @version      2.1.0
+// @version      2.2.0
 // @description  Downloads the original image on each already-opened gallery page, then advances to the next page.
 // @match        *://e-hentai.org/s/*
 // @match        *://exhentai.org/s/*
@@ -34,6 +34,7 @@
   let executionInProgress = false;
 
   class PageNotReadyError extends Error {}
+  class DownloadFailedError extends Error {}
 
   function readState() {
     try {
@@ -149,8 +150,8 @@
         name,
         saveAs: false,
         onload: resolve,
-        onerror: (details) => reject(new Error(details?.error || 'download failed')),
-        ontimeout: () => reject(new Error('download timed out')),
+        onerror: (details) => reject(new DownloadFailedError(details?.error || 'download failed')),
+        ontimeout: () => reject(new DownloadFailedError('download timed out')),
       });
     });
   }
@@ -313,15 +314,17 @@
     } catch (error) {
       const failed = readState();
       const failedPage = parseImagePage(location.href);
-      if (error instanceof PageNotReadyError && failedPage && failed.running) {
+      const isRecoverable = error instanceof PageNotReadyError || error instanceof DownloadFailedError;
+      if (isRecoverable && failedPage && failed.running) {
         const pageKey = `${failedPage.galleryId}-${failedPage.page}`;
         const retryCount = (failed.retriesByPage?.[pageKey] || 0) + 1;
         failed.retriesByPage = { ...(failed.retriesByPage || {}), [pageKey]: retryCount };
+        const reason = error instanceof DownloadFailedError ? '原图下载失败' : '页面未稳定加载';
 
         if (retryCount <= 10) {
           failed.retryPending = true;
           writeState(failed);
-          console.warn(`[EH original downloader] Page ${failedPage.page} was not ready; refreshing for retry ${retryCount}/10.`);
+          console.warn(`[EH original downloader] Page ${failedPage.page}: ${reason}; refreshing for retry ${retryCount}/10.`, error.message);
           setTimeout(() => location.reload(), 3000);
           return;
         }
@@ -329,7 +332,7 @@
         failed.running = false;
         failed.retryPending = false;
         writeState(failed);
-        alert(`原图自动下载已停止：第 ${failedPage.page} 页连续 10 次刷新后仍未完成加载。`);
+        alert(`原图自动下载已停止：第 ${failedPage.page} 页连续 10 次重试后仍然${reason}（${error.message}）。`);
         return;
       }
       failed.running = false;
