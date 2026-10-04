@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         E-Hentai Original Image Downloader
 // @namespace    local.ehentai.original-downloader
-// @version      2.2.0
-// @description  Downloads the original image on each already-opened gallery page, then advances to the next page.
+// @version      2.4.0
+// @description  Downloads originals or automatically browses each already-opened gallery image page.
 // @match        *://e-hentai.org/s/*
 // @match        *://exhentai.org/s/*
 // @grant        GM_download
@@ -28,6 +28,8 @@
     completedPages: {},
     retriesByPage: {},
     retryPending: false,
+    mode: 'download',
+    browseDelayMs: 5000,
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -166,6 +168,21 @@
     state.completedPages = {};
     state.retriesByPage = {};
     state.retryPending = false;
+    state.mode = 'download';
+    writeState(state);
+    location.reload();
+  }
+
+  function startBrowse() {
+    const state = readState();
+    const currentPage = parseImagePage(location.href);
+    state.running = true;
+    state.mode = 'browse';
+    state.count = 0;
+    state.lastPage = '';
+    state.galleryId = currentPage?.galleryId ?? null;
+    state.retriesByPage = {};
+    state.retryPending = false;
     writeState(state);
     location.reload();
   }
@@ -173,6 +190,7 @@
   function stop() {
     const state = readState();
     state.running = false;
+    state.mode = 'idle';
     writeState(state);
   }
 
@@ -209,25 +227,92 @@
     throw new PageNotReadyError(`第 ${expectedPage} 页没有在 60 秒内完成加载（原图链接、页码和显示图片未能同时稳定）。`);
   }
 
+  async function waitForBrowsePageReady(expectedPage, timeoutMs = 60000) {
+    const started = Date.now();
+    let previousSnapshot = '';
+    let stableSince = 0;
+    while (Date.now() - started < timeoutMs) {
+      const image = document.querySelector('#img');
+      const counter = getPageCounter();
+      const isReady = image?.complete && image.naturalWidth > 0 && counter?.current === expectedPage;
+      if (isReady) {
+        const snapshot = `${counter.current}/${counter.total}|${image.currentSrc}`;
+        if (snapshot !== previousSnapshot) {
+          previousSnapshot = snapshot;
+          stableSince = Date.now();
+        } else if (Date.now() - stableSince >= 800) {
+          return counter;
+        }
+      } else {
+        previousSnapshot = '';
+        stableSince = 0;
+      }
+      await sleep(250);
+    }
+    throw new PageNotReadyError(`第 ${expectedPage} 页没有在 60 秒内完成图片加载。`);
+  }
+
+  function pageBottom() {
+    const root = document.documentElement;
+    const body = document.body;
+    return Math.max(
+      0,
+      root.scrollHeight,
+      root.offsetHeight,
+      body?.scrollHeight || 0,
+      body?.offsetHeight || 0,
+    ) - window.innerHeight;
+  }
+
+  function scrollPageOverDuration(durationMs) {
+    return new Promise((resolve) => {
+      const startedAt = performance.now();
+      const startY = window.scrollY;
+      const targetY = pageBottom();
+      const distance = Math.max(0, targetY - startY);
+
+      const step = (now) => {
+        const progress = Math.min(1, (now - startedAt) / durationMs);
+        window.scrollTo(0, Math.round(startY + distance * progress));
+        if (progress < 1) {
+          requestAnimationFrame(step);
+        } else {
+          resolve();
+        }
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
   function addPanel() {
     if (document.querySelector('#eh-original-downloader-panel')) return;
     const panel = document.createElement('section');
     panel.id = 'eh-original-downloader-panel';
     panel.innerHTML = `
-      <strong>原图自动下载</strong>
+      <strong>画廊自动工具</strong>
       <span id="eh-original-downloader-status">未运行</span>
-      <label>间隔 <input id="eh-original-downloader-delay" type="number" min="1000" step="500"> ms</label>
-      <button id="eh-original-downloader-toggle" type="button">开始</button>
+      <label>下载间隔 <input id="eh-original-downloader-delay" type="number" min="1000" step="500"> ms</label>
+      <button id="eh-original-downloader-toggle" type="button">开始下载</button>
+      <label>浏览时长 <input id="eh-original-downloader-browse-delay" type="number" min="1000" step="500"> ms</label>
+      <button id="eh-original-downloader-browse" type="button">开始浏览（不下载）</button>
       <button id="eh-original-downloader-stop" type="button">停止</button>
     `;
     document.body.append(panel);
 
     const status = panel.querySelector('#eh-original-downloader-status');
     const delayInput = panel.querySelector('#eh-original-downloader-delay');
+    const browseDelayInput = panel.querySelector('#eh-original-downloader-browse-delay');
     const update = () => {
       const state = readState();
-      status.textContent = state.running ? `运行中：已确认 ${state.count} 张` : `未运行：已确认 ${state.count} 张`;
+      if (state.running && state.mode === 'browse') {
+        status.textContent = `浏览中：已翻 ${state.count} 张`;
+      } else if (state.running) {
+        status.textContent = `下载中：已确认 ${state.count} 张`;
+      } else {
+        status.textContent = '未运行';
+      }
       delayInput.value = state.delayMs;
+      browseDelayInput.value = state.browseDelayMs;
     };
 
     delayInput.addEventListener('change', () => {
@@ -236,8 +321,17 @@
       writeState(state);
       update();
     });
+    browseDelayInput.addEventListener('change', () => {
+      const state = readState();
+      state.browseDelayMs = Math.max(1000, Number(browseDelayInput.value) || DEFAULT_STATE.browseDelayMs);
+      writeState(state);
+      update();
+    });
     panel.querySelector('#eh-original-downloader-toggle').addEventListener('click', () => {
       start();
+    });
+    panel.querySelector('#eh-original-downloader-browse').addEventListener('click', () => {
+      startBrowse();
     });
     panel.querySelector('#eh-original-downloader-stop').addEventListener('click', () => {
       stop();
@@ -264,6 +358,38 @@
     try {
       if (state.galleryId !== null && state.galleryId !== page.galleryId) {
         throw new Error('当前页不属于本次下载的画廊，已停止以避免混入其他画廊。');
+      }
+
+      if (state.mode === 'browse') {
+        window.scrollTo(0, 0);
+        const counter = await waitForBrowsePageReady(page.page);
+        const browsing = readState();
+        if (!browsing.running || browsing.mode !== 'browse') return;
+        const pageKey = `${page.galleryId}-${page.page}`;
+        if (browsing.retriesByPage?.[pageKey]) {
+          browsing.retriesByPage = { ...browsing.retriesByPage };
+          delete browsing.retriesByPage[pageKey];
+        }
+        browsing.count += 1;
+        browsing.lastPage = location.href;
+        writeState(browsing);
+
+        // One browsing duration covers the whole page: start at the top and
+        // move at a constant rate to the bottom before advancing.
+        await scrollPageOverDuration(Math.max(1000, browsing.browseDelayMs));
+        const next = getNextLink();
+        if (!next?.href || next.href === location.href) {
+          if (counter && counter.current < counter.total) {
+            throw new Error(`已浏览第 ${counter.current} 张，但没有定位到第 ${counter.current + 1} 张的右向三角链接。`);
+          }
+          browsing.running = false;
+          browsing.mode = 'idle';
+          writeState(browsing);
+          console.info('[EH gallery browser] Reached the last page; stopped.');
+          return;
+        }
+        next.click();
+        return;
       }
 
       const { link: originalLink, counter } = await waitForPageReady(page.page);
@@ -356,6 +482,7 @@
   // These two entries are intentionally available from Tampermonkey's popup as
   // a fallback when a browser/extension blocks the floating page control.
   GM_registerMenuCommand('开始原图自动下载', start);
+  GM_registerMenuCommand('开始自动浏览（不下载）', startBrowse);
   GM_registerMenuCommand('停止原图自动下载', stop);
 
   const initialize = () => {
